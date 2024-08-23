@@ -28,12 +28,19 @@ const extractAdditionalInfo = (name) => {
   const endIndex = name.indexOf("}");
   if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
     const additionalInfoStr = name.substring(startIndex, endIndex + 1);
-    return JSON.parse(additionalInfoStr);
+    try {
+      return JSON.parse(additionalInfoStr);
+    } catch (error) {
+      console.error(`Failed to parse JSON from cue name: ${name}`, error);
+      return {};
+    }
   }
   return {};
 };
 
+
 const mergeCues = (cues) => {
+  //console.log("Processing cues:", cues);
   const pairs = [];
   let currentSong = null;
   let currentSongPartsCues = [];
@@ -42,13 +49,20 @@ const mergeCues = (cues) => {
     if (cue.name.includes("<end>")) {
       if (currentSong) {
         const addInfo = extractAdditionalInfo(currentSong.name);
+  
+        // Safely handle the tempo property
+        const tempoStr = addInfo.tempo ? String(addInfo.tempo) : "120BPM"; // Default tempo if undefined
+  
+        // Calculate the song length in seconds.
         const calculatedSongLength =
-          ((cue.time - currentSong.time) * 2) /
-          (parseInt(addInfo.tempo.replace(/[^0-9]/g, "")) / 60);
+          ((cue.time - currentSong.time)) /
+          (parseInt(tempoStr.replace(/[^0-9]/g, "")) / 60);
+  
         if (currentSong.name.includes("{") && currentSong.name.includes("}")) {
           const clearedCueName = currentSong.name.split("{").shift();
           currentSong.name = clearedCueName;
         }
+  
         pairs.push({
           song: [currentSong, cue],
           additionalInfo: addInfo,
@@ -57,6 +71,7 @@ const mergeCues = (cues) => {
           songLengthInSec: calculatedSongLength,
           songPartsCues: currentSongPartsCues,
         });
+  
         currentSong = null;
         currentSongPartsCues = [];
       }
@@ -71,6 +86,7 @@ const mergeCues = (cues) => {
       currentSong = cue;
     }
   });
+
   globalMergedCues = pairs;
   return pairs;
 };
@@ -82,10 +98,21 @@ const fetchCues = async () => {
     const mergedCues = mergeCues(cues.map((c) => c.raw));
     return mergedCues;
   } catch (error) {
-    console.error("An error occurred:", error);
+    console.error("Error fetching cues:", error);
     throw error;
   }
 };
+
+app.get("/get-tempo", async (req, res) => {
+  try {
+    await ableton.start();
+    const tempo = await ableton.song.get("tempo"); // Adjust according to your API
+    res.status(200).json({ tempo });
+  } catch (error) {
+    console.error("Error fetching tempo:", error);
+    res.status(500).send("Error fetching tempo");
+  }
+});
 
 ableton
   .start()
@@ -95,71 +122,82 @@ ableton
       wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: "song_time", time }));
-
-          const currentSongIndex = globalMergedCues.findIndex(
-            (cue) => cue.song[0].time <= time && cue.song[1].time >= time
-          );
-          const currentPartIndex = globalMergedCues[
-            currentSongIndex
-          ].songPartsCues.findIndex((partCue, i) => {
-            return partCue.time <= time && partCue.time + partCue.length > time;
-          });
-          if (globalMergedCues && currentSongIndex !== -1) {
-            const currentSong = globalMergedCues[currentSongIndex];
-            const currentSongProgress =
-              (time - currentSong.song[0].time) / currentSong.songLengthInBars;
-            currentSongProgressEmitter.emit(
-              "songProgressChanged",
-              currentSongProgress * 100
+  
+          // Check if globalMergedCues is not empty
+          if (globalMergedCues.length > 0) {
+            const currentSongIndex = globalMergedCues.findIndex(
+              (cue) => cue.song[0].time <= time && cue.song[1].time >= time
             );
-            if (currentPartIndex !== -1) {
-              const currentPartCue =
-                currentSong.songPartsCues[currentPartIndex];
-              if (currentPartCue) {
-                const currentPartProgress =
-                  (time - currentPartCue.time) / currentPartCue.length;
-                currentPartProgressEmitter.emit(
-                  "partProgressChanged",
-                  currentPartProgress * 100
-                );
+  
+            // Ensure currentSongIndex is valid and globalMergedCues has the song at currentSongIndex
+            if (currentSongIndex !== -1 && globalMergedCues[currentSongIndex]) {
+              const currentSong = globalMergedCues[currentSongIndex];
+              const currentPartIndex = currentSong.songPartsCues.findIndex(
+                (partCue, i) => {
+                  return (
+                    partCue.time <= time && partCue.time + partCue.length > time
+                  );
+                }
+              );
+  
+              const currentSongProgress =
+                (time - currentSong.song[0].time) / currentSong.songLengthInBars;
+              currentSongProgressEmitter.emit(
+                "songProgressChanged",
+                currentSongProgress * 100
+              );
+  
+              if (currentPartIndex !== -1) {
+                const currentPartCue = currentSong.songPartsCues[currentPartIndex];
+                if (currentPartCue) {
+                  const currentPartProgress =
+                    (time - currentPartCue.time) / currentPartCue.length;
+                  currentPartProgressEmitter.emit(
+                    "partProgressChanged",
+                    currentPartProgress * 100
+                  );
+                }
               }
-            }
-          }
-          selectedSongIndexEmitter.emit(
-            "selectedSongIndexChanged",
-            currentSongIndex
-          );
-          selectedPartIndexEmitter.emit(
-            "selectedPartIndexChanged",
-            currentPartIndex
-          );
-          if (
-            currentSongIndex !== -1 &&
-            globalMergedCues[currentSongIndex].song[1].time ===
-              parseInt(time.toFixed(0))
-          ) {
-            const nextIndex = currentSongIndex + 1;
-            if (!globalMergedCues[currentSongIndex].doesStop) {
+  
               selectedSongIndexEmitter.emit(
                 "selectedSongIndexChanged",
-                nextIndex
+                currentSongIndex
               );
-              const cuePoint = new CuePoint(
-                ableton,
-                globalMergedCues[nextIndex].song[0]
+              selectedPartIndexEmitter.emit(
+                "selectedPartIndexChanged",
+                currentPartIndex
               );
-              await cuePoint.jump();
-            } else {
-              await ableton.song.stopPlaying();
-              const cuePoint = new CuePoint(
-                ableton,
-                globalMergedCues[nextIndex].song[0]
-              );
-              await cuePoint.jump();
-              selectedSongIndexEmitter.emit(
-                "selectedSongIndexChanged",
-                nextIndex
-              );
+  
+              // Handle automatic cue jumping
+              if (
+                currentSongIndex !== -1 &&
+                globalMergedCues[currentSongIndex].song[1].time ===
+                  parseInt(time.toFixed(0))
+              ) {
+                const nextIndex = currentSongIndex + 1;
+                if (!globalMergedCues[currentSongIndex].doesStop) {
+                  selectedSongIndexEmitter.emit(
+                    "selectedSongIndexChanged",
+                    nextIndex
+                  );
+                  const cuePoint = new CuePoint(
+                    ableton,
+                    globalMergedCues[nextIndex].song[0]
+                  );
+                  await cuePoint.jump();
+                } else {
+                  await ableton.song.stopPlaying();
+                  const cuePoint = new CuePoint(
+                    ableton,
+                    globalMergedCues[nextIndex].song[0]
+                  );
+                  await cuePoint.jump();
+                  selectedSongIndexEmitter.emit(
+                    "selectedSongIndexChanged",
+                    nextIndex
+                  );
+                }
+              }
             }
           }
         }
@@ -167,21 +205,21 @@ ableton
     });
 
     ableton.song.addListener("is_playing", (isPlaying) => {
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: "is_playing", isPlaying }));
         }
       });
     });
     ableton.song.addListener("tempo", (tempo) => {
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: "tempo", tempo }));
         }
       });
     });
     ableton.song.addListener("loop", (isLooped) => {
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: "is_looped", isLooped }));
         }
@@ -192,7 +230,7 @@ ableton
         type: "song_progress",
         songProgress: songProgress,
       });
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(message);
         }
@@ -203,7 +241,7 @@ ableton
         type: "part_progress",
         partProgress: partProgress,
       });
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(message);
         }
@@ -214,7 +252,7 @@ ableton
         type: "selected_part_index",
         partIndex: partIndex,
       });
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(message);
         }
@@ -225,14 +263,14 @@ ableton
         type: "selected_song_index",
         songIndex: songIndex,
       });
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(message);
         }
       });
     });
     cueEventEmitter.on("cuesUpdated", (updatedCues) => {
-      wss.clients.forEach((client) => {
+      wss.clients.forEach(async (client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(
             JSON.stringify({ type: "cues_updated", cues: updatedCues })
@@ -256,8 +294,8 @@ app.get("/cues", async (req, res) => {
     res.setHeader("Content-Security-Policy", "script-src-attr 'self'");
     res.json(mergedCues);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "An error occurred" });
+    console.error("Error in /cues endpoint:", error);
+    res.status(500).json({ error: "An error occurred", details: error.message });
   }
 });
 
@@ -312,23 +350,39 @@ app.post("/set-loop-area", async (req, res) => {
 });
 
 app.post("/set-selected-song-index", async (req, res) => {
-  const songIndex = req.body.songIndex;
-  const partIndex = req.body.partIndex;
+  const { songIndex, partIndex } = req.body;
+
   try {
+    // Check if songIndex is within bounds
+    if (songIndex < 0 || songIndex >= globalMergedCues.length) {
+      throw new Error("Invalid songIndex");
+    }
+
+    // Check if songPartsCues is defined if partIndex is not -1
+    if (partIndex !== -1 && (!globalMergedCues[songIndex].songPartsCues ||
+        partIndex < 0 ||
+        partIndex >= globalMergedCues[songIndex].songPartsCues.length)) {
+      throw new Error("Invalid partIndex or songPartsCues not defined");
+    }
+
     await ableton.start();
+
     if (partIndex === -1) {
-      const songCuePoint = new CuePoint(
-        ableton,
-        globalMergedCues[songIndex].song[0]
-      );
+      const song = globalMergedCues[songIndex]?.song[0];
+      if (!song) {
+        throw new Error("No song found at the specified index");
+      }
+      const songCuePoint = new CuePoint(ableton, song);
       await songCuePoint.jump();
     } else {
-      const partCuePoint = new CuePoint(
-        ableton,
-        globalMergedCues[songIndex].songPartsCues[partIndex]
-      );
+      const part = globalMergedCues[songIndex]?.songPartsCues[partIndex];
+      if (!part) {
+        throw new Error("No part found at the specified index");
+      }
+      const partCuePoint = new CuePoint(ableton, part);
       await partCuePoint.jump();
     }
+
     res.status(200).json({
       message: "Cue received and processed in Ableton Live",
     });

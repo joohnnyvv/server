@@ -32,7 +32,7 @@ Follow these steps to set up the server on your local machine:
 When creating a setlist, it's important to follow the specific Locator naming conventions for songs and their parts to ensure proper processing and playback.
 
 
-- **Song Locator Name Format:**
+- **Song Start Locator Name Format:**
 
   The song start Locator should begin with the actual name of the song, followed by additional information enclosed in curly braces `{}`. This additional information should include the tempo and key of the song.
 
